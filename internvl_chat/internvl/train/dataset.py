@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 import transformers
-from decord import VideoReader
+import cv2
 from internvl.conversation import get_conv_template
 from PIL import Image
 from torch.utils.data import ConcatDataset, WeightedRandomSampler
@@ -101,13 +101,25 @@ def read_frames_decord(
         video_path, num_frames, sample='rand', fix_start=None,
         client=None, clip=None, min_num_frames=4
 ):
+    # cv2 ベースの実装（decord の代替）
     if 's3://' in video_path:
+        # S3 からの読み込みは一時ファイル経由で対応
+        import tempfile
         video_bytes = client.get(video_path)
-        video_reader = VideoReader(io.BytesIO(video_bytes), num_threads=1)
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+            tmp.write(video_bytes)
+            tmp_path = tmp.name
+        cap = cv2.VideoCapture(tmp_path)
+        import os as _os
+        _os.unlink(tmp_path)
     else:
-        video_reader = VideoReader(video_path, num_threads=1)
-    vlen = len(video_reader)
-    fps = video_reader.get_avg_fps()
+        cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    vlen = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
     duration = vlen / float(fps)
     if clip:
         start, end = clip
@@ -124,8 +136,20 @@ def read_frames_decord(
     )
     if clip:
         frame_indices = [f + start_index for f in frame_indices]
-    frames = video_reader.get_batch(frame_indices).asnumpy()  # (T, H, W, C), np.uint8
-    frames = [Image.fromarray(frames[i]) for i in range(frames.shape[0])]
+
+    # フレームを取得（cv2 は BGR なので RGB に変換）
+    frames = []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(frame))
+        else:
+            # フレーム読み取り失敗時は最後のフレームを複製
+            if frames:
+                frames.append(frames[-1].copy())
+    cap.release()
     return frames
 
 

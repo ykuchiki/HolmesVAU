@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from PIL import Image
-from decord import VideoReader, cpu
+import cv2
 import matplotlib.pyplot as plt
 
 from transformers import AutoModel, AutoTokenizer
@@ -9,12 +9,58 @@ from holmesvau.ATS.Temporal_Sampler import Temporal_Sampler
 from holmesvau.internvl_utils import build_transform, get_index, dynamic_preprocess
 
 
+# decord.VideoReader の cv2 ベース代替実装
+class VideoReader:
+    """decord.VideoReader 互換ラッパー（cv2 ベース）"""
+    def __init__(self, path, ctx=None, num_threads=1):
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {path}")
+        self._len = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._fps = self.cap.get(cv2.CAP_PROP_FPS)
+
+    def __len__(self):
+        return self._len
+
+    def get_avg_fps(self):
+        return self._fps
+
+    def __getitem__(self, idx):
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = self.cap.read()
+        if not ret:
+            raise IndexError(f"Cannot read frame {idx}")
+        # decord は RGB で返すので BGR→RGB 変換
+        return _FrameWrapper(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+    def __del__(self):
+        if self.cap:
+            self.cap.release()
+
+
+class _FrameWrapper:
+    """decord の frame.asnumpy() 互換"""
+    def __init__(self, arr):
+        self._arr = arr
+
+    def asnumpy(self):
+        return self._arr
+
+
+def cpu(n):
+    """decord.cpu() のダミー"""
+    return None
+
+
 def load_model(mllm_path, sampler_path, device):
+    # CUDA: bfloat16 + Flash Attention、CPU: bfloat16（MPS は未サポート）
+    use_flash_attn = device.type == 'cuda'
+
     model = AutoModel.from_pretrained(
         mllm_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-        use_flash_attn=True,
+        use_flash_attn=use_flash_attn,
         trust_remote_code=True,
         ).eval()
     tokenizer = AutoTokenizer.from_pretrained(mllm_path, trust_remote_code=True, use_fast=False)
@@ -59,7 +105,8 @@ def generate(video_path, prompt, model, tokenizer, generation_config, sampler, d
         
     # generate
     history = None
-    sparse_pixel_values = sparse_pixel_values.to(torch.bfloat16).to(model.device)
+    # モデルの dtype に合わせる（MPS は bfloat16 未対応）
+    sparse_pixel_values = sparse_pixel_values.to(model.dtype).to(model.device)
     video_prefix = ''.join([f'Frame{i+1}: <image>\n' for i in range(len(num_patches_list))])
     question = video_prefix + prompt
     # Frame1: <image>\nFrame2: <image>\n...\nFrame8: <image>\n{question}

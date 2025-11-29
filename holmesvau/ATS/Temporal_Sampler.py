@@ -6,8 +6,13 @@ from .anomaly_scorer import URDMU
 class Temporal_Sampler():
     def __init__(self, ckpt_path, device):
         self.device = device
+        # CUDA/CPU 両対応（MPS は未サポート）
+        self.dtype = torch.bfloat16
+
         self.anomaly_scorer = URDMU().to(device)
-        self.anomaly_scorer.load_state_dict(torch.load(ckpt_path))
+        # map_location で任意のデバイスに読み込めるようにする
+        state_dict = torch.load(ckpt_path, map_location=device)
+        self.anomaly_scorer.load_state_dict(state_dict)
         self.tau = 0.1
 
     def get_anomaly_scores(self, pixel_values, model):
@@ -20,7 +25,7 @@ class Temporal_Sampler():
                 batches.append(batch)   
             return batches
         with torch.no_grad():
-            pixel_values = pixel_values.to(torch.bfloat16)
+            pixel_values = pixel_values.to(self.dtype)
             pixel_values_batched = batchify(pixel_values)
             cls_tokens = []
             for b, data in enumerate(pixel_values_batched):
